@@ -1,11 +1,12 @@
 from pathlib import Path
+
+import httpx
+from langchain.messages import HumanMessage
 from langchain_core.runnables import RunnableConfig
 
-from langchain.messages import HumanMessage
-from src.features.chat.graph.workflow import compiled_graph
-import httpx
+from src.core.config import get_settings
 from src.features.chat.graph.state import ChatAgentState
-from core.config import get_settings
+from src.features.chat.graph.workflow import get_graph
 
 settings = get_settings()
 BOT_TOKEN = settings.BOT_TOKEN
@@ -60,7 +61,6 @@ async def download_file(client: httpx.AsyncClient, file_id: str) -> Path | None:
         return None
 
 
-
 async def handle_text(client, msg) -> str:
     text = msg["text"]
 
@@ -73,20 +73,24 @@ async def handle_text(client, msg) -> str:
             return "👋 Hello! Send me text, photo, voice, file, location..."
         return f"Command: {command}, args: {args}"
 
-    config: RunnableConfig = {"configurable": {"thread_id": "1"}}
+    # Use the Telegram chat id as the thread id, so each chat gets its own
+    # memory. (You had "1", which makes every user share one conversation.)
+    chat_id = msg["chat"]["id"]
+    config: RunnableConfig = {"configurable": {"thread_id": str(chat_id)}}
+
+    # FIX: get_graph() is async, so it must be awaited.
+    # Without await you get a coroutine object, not the graph.
+    compiled_graph = await get_graph()
 
     res = await compiled_graph.ainvoke(
         ChatAgentState(
-
-        messages=[HumanMessage(content=text)],
-        chat_id=msg["chat"]["id"],
-        )
-        ,
-        config=config
-
+            messages=[HumanMessage(content=text)],
+            chat_id=chat_id,
+        ),
+        config=config,
     )
-    # print(f"[INFO] Graph result: {res}")
 
+    # The last message in the state is the model's reply
     ready = res["messages"][-1].content
 
     return ready

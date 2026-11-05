@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Header, HTTPException, Request
 
-from features.chat.services import HANDLERS, WEBHOOK_SECRET, send_message
+from src.features.chat.services import HANDLERS, WEBHOOK_SECRET, send_message
 
 app = APIRouter()
 

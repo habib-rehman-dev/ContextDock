@@ -1,7 +1,7 @@
 from langchain_groq import ChatGroq
 
 # impor settings from core.config
-from core.config import get_settings
+from src.core.config import get_settings
 
 settings = get_settings()
 

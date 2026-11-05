@@ -22,6 +22,8 @@ dependencies = [
     "llama-index-core>=0.14.25",
     "llama-index-embeddings-huggingface>=0.8.0",
     "ipywidgets>=8.1.9",
+    "langgraph-checkpoint-postgres>=3.2.0",
+    "aiosqlite>=0.22.1",
 ]
 
 [project.scripts]

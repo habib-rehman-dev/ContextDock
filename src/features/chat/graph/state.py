@@ -7,7 +7,7 @@ from pydantic import BaseModel
 
 
 class ChatAgentState(BaseModel):
-    # 'add_messages' appends new entries to existing message list
     messages: Annotated[list[BaseMessage], add_messages]
     chat_id: int
     user_intent: str | None = "general_chat"
+    pending_question: str | None = None   # NEW

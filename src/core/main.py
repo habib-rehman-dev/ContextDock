@@ -4,7 +4,7 @@ import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI
 
-from features.chat.router import app as chat_router
+from src.features.chat.router import app as chat_router
 
 # Load variables from .env into the environment
 load_dotenv()

@@ -1,10 +1,11 @@
 from contextlib import asynccontextmanager
 
-import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-from features.chat.router import app as chat_router
+from src.features.chat.graph.workflow import init_graph
+from src.features.chat.router import app as chat_router
 
 # Load variables from .env into the environment
 load_dotenv()
@@ -12,17 +13,17 @@ load_dotenv()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Runs on startup: create ONE reusable HTTP client
-    # local_address="0.0.0.0" forces IPv4 (avoids broken IPv6 routes)
-    transport = httpx.AsyncHTTPTransport(local_address="0.0.0.0", retries=2)
-    app.state.client = httpx.AsyncClient(
-        transport=transport,
-        timeout=httpx.Timeout(15.0, connect=10.0),
-    )
-    yield
-    # Runs on shutdown: close connections cleanly
-    await app.state.client.aclose()
+    # Opens an aiosqlite connection and closes it automatically on shutdown
+    async with AsyncSqliteSaver.from_conn_string(
+        "chat_graph_checkpoint.db"
+    ) as checkpointer:
+        await checkpointer.setup()  # creates the checkpoint tables if missing
+        init_graph(checkpointer)  # build the graph with the live checkpointer
+        yield  # the app runs while we're paused here
+    # leaving the `async with` closes the DB connection
 
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(lifespan=lifespan)  # <-- add lifespan here
 app.include_router(chat_router, tags=["chat"])
+
+

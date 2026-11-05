@@ -1,0 +1,547 @@
+Directory structure:
+└── ContextDock/
+    ├── main.py
+    └── src/
+        ├── main.py
+        ├── core/
+        │   ├── config.py
+        │   └── main.py
+        └── features/
+            └── chat/
+                ├── router.py
+                ├── services.py
+                └── graph/
+                    ├── edges.py
+                    ├── llms.py
+                    ├── nodes.py
+                    ├── state.py
+                    └── workflow.py
+
+================================================
+FILE: main.py
+================================================
+from contextlib import asynccontextmanager
+
+import httpx
+from dotenv import load_dotenv
+from fastapi import FastAPI
+
+from src.features.chat.router import app as chat_router
+
+# Load variables from .env into the environment
+load_dotenv()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Runs on startup: create ONE reusable HTTP client
+    # local_address="0.0.0.0" forces IPv4 (avoids broken IPv6 routes)
+    transport = httpx.AsyncHTTPTransport(local_address="0.0.0.0", retries=2)
+    app.state.client = httpx.AsyncClient(
+        transport=transport,
+        timeout=httpx.Timeout(15.0, connect=10.0),
+    )
+    yield
+    # Runs on shutdown: close connections cleanly
+    await app.state.client.aclose()
+
+
+app = FastAPI(lifespan=lifespan)
+app.include_router(chat_router, tags=["chat"])
+
+
+
+================================================
+FILE: src/main.py
+================================================
+from contextlib import asynccontextmanager
+
+from dotenv import load_dotenv
+from fastapi import FastAPI
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+from src.features.chat.graph.workflow import init_graph
+from src.features.chat.router import app as chat_router
+
+# Load variables from .env into the environment
+load_dotenv()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Opens an aiosqlite connection and closes it automatically on shutdown
+    async with AsyncSqliteSaver.from_conn_string(
+        "chat_graph_checkpoint.db"
+    ) as checkpointer:
+        await checkpointer.setup()  # creates the checkpoint tables if missing
+        init_graph(checkpointer)  # build the graph with the live checkpointer
+        yield  # the app runs while we're paused here
+    # leaving the `async with` closes the DB connection
+
+
+app = FastAPI(lifespan=lifespan)  # <-- add lifespan here
+app.include_router(chat_router, tags=["chat"])
+
+
+
+
+
+================================================
+FILE: src/core/config.py
+================================================
+from functools import lru_cache
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from pydantic import SecretStr
+
+class Settings(BaseSettings):
+    # Reads values from the .env file; ignores variables we don't declare
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    BOT_TOKEN: str
+    WEBHOOK_SECRET: str | None = None
+    GROQ_API_KEY: SecretStr 
+
+
+
+
+
+
+@lru_cache  # build Settings once, reuse everywhere
+def get_settings() -> Settings:
+    return Settings() # type: ignore
+
+
+================================================
+FILE: src/core/main.py
+================================================
+from contextlib import asynccontextmanager
+
+import httpx
+from dotenv import load_dotenv
+from fastapi import FastAPI
+
+from src.features.chat.router import app as chat_router
+
+# Load variables from .env into the environment
+load_dotenv()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Runs on startup: create ONE reusable HTTP client
+    # local_address="0.0.0.0" forces IPv4 (avoids broken IPv6 routes)
+    transport = httpx.AsyncHTTPTransport(local_address="0.0.0.0", retries=2)
+    app.state.client = httpx.AsyncClient(
+        transport=transport,
+        timeout=httpx.Timeout(15.0, connect=10.0),
+    )
+    yield
+    # Runs on shutdown: close connections cleanly
+    await app.state.client.aclose()
+
+
+app = FastAPI(lifespan=lifespan)
+app.include_router(chat_router, tags=["chat"])
+
+
+
+================================================
+FILE: src/features/chat/router.py
+================================================
+from fastapi import APIRouter, Header, HTTPException, Request
+
+from src.features.chat.services import HANDLERS, WEBHOOK_SECRET, send_message
+
+app = APIRouter()
+
+
+@app.post("/telegram_message")
+async def telegram_webhook(
+    request: Request,
+    # Telegram sends this header if you set secret_token when registering the webhook
+    x_telegram_bot_api_secret_token: str | None = Header(default=None),
+):
+    if WEBHOOK_SECRET and x_telegram_bot_api_secret_token != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    update = await request.json()
+    client = request.app.state.client
+
+    message = update.get("message")
+
+    if not message:
+        return {"status": "ignored"}
+
+    chat_id = message["chat"]["id"]
+    # user = message["from"]
+
+    reply = None
+    for key, handler in HANDLERS:
+        if key in message:
+            reply = await handler(client, message)
+            break
+
+    if reply is None:
+        reply = f"🤷 Unsupported type. Keys: {list(message.keys())}"
+
+    await send_message(client, chat_id, reply)
+
+
+
+================================================
+FILE: src/features/chat/services.py
+================================================
+from pathlib import Path
+
+import httpx
+from langchain.messages import HumanMessage
+from langchain_core.runnables import RunnableConfig
+
+from src.core.config import get_settings
+from src.features.chat.graph.state import ChatAgentState
+from src.features.chat.graph.workflow import get_graph
+
+settings = get_settings()
+BOT_TOKEN = settings.BOT_TOKEN
+WEBHOOK_SECRET = settings.WEBHOOK_SECRET
+
+# Fail fast with a clear message if the token is missing
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is missing. Add it to your .env file.")
+
+# Base URL for every Telegram Bot API method
+TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"  # for methods
+FILE_API = f"https://api.telegram.org/file/bot{BOT_TOKEN}"  # for downloads
+
+
+# Downloaded files are saved here
+DOWNLOAD_DIR = Path("downloads")
+DOWNLOAD_DIR.mkdir(exist_ok=True)
+
+
+async def send_message(client: httpx.AsyncClient, chat_id: int, text: str):
+    """Send a text reply to a chat."""
+    try:
+        resp = await client.post(
+            f"{TELEGRAM_API}/sendMessage",
+            json={"chat_id": chat_id, "text": text},
+        )
+        resp.raise_for_status()
+    except httpx.HTTPError as err:
+        print(f"[ERROR] sendMessage failed: {err}")
+
+
+async def download_file(client: httpx.AsyncClient, file_id: str) -> Path | None:
+    """Two-step download: getFile -> file_path -> bytes saved to disk."""
+    try:
+        # Step 1: ask Telegram where the file lives
+        r = await client.get(f"{TELEGRAM_API}/getFile", params={"file_id": file_id})
+        r.raise_for_status()
+        file_path = r.json()["result"]["file_path"]  # e.g. "photos/file_12.jpg"
+
+        # Step 2: download the bytes from that path
+        content = await client.get(f"{FILE_API}/{file_path}")
+        content.raise_for_status()
+
+        # Save with a unique-ish name so files don't overwrite each other
+        save_path = DOWNLOAD_DIR / f"{file_id[:10]}_{Path(file_path).name}"
+        save_path.write_bytes(content.content)
+        print(f"[INFO] downloaded {file_path} -> {save_path}")
+        return save_path
+    except httpx.HTTPError as err:
+        # Usually: file bigger than 20 MB, or network/VPN issue
+        print(f"[ERROR] download failed: {err}")
+        return None
+
+
+async def handle_text(client, msg) -> str:
+    text = msg["text"]
+
+    # Commands look like "/start" or "/start@MyBot hello"
+    if text.startswith("/"):
+        parts = text.split()
+        command = parts[0].split("@")[0]  # strip "@BotName" if present
+        args = parts[1:]  # everything after the command
+        if command == "/start":
+            return "👋 Hello! Send me text, photo, voice, file, location..."
+        return f"Command: {command}, args: {args}"
+
+    # Use the Telegram chat id as the thread id, so each chat gets its own
+    # memory. (You had "1", which makes every user share one conversation.)
+    chat_id = msg["chat"]["id"]
+    config: RunnableConfig = {"configurable": {"thread_id": str(chat_id)}}
+
+    # FIX: get_graph() is async, so it must be awaited.
+    # Without await you get a coroutine object, not the graph.
+    compiled_graph = await get_graph()
+
+    res = await compiled_graph.ainvoke(
+        ChatAgentState(
+            messages=[HumanMessage(content=text)],
+            chat_id=chat_id,
+        ),
+        config=config,
+    )
+
+    # The last message in the state is the model's reply
+    ready = res["messages"][-1].content
+
+    return ready
+
+
+async def handle_photo(client, msg) -> str:
+    # `photo` is a LIST of the same image in different sizes.
+    # The last item is the biggest one.
+    best = msg["photo"][-1]
+    caption = msg.get("caption", "(no caption)")
+    path = await download_file(client, best["file_id"])
+    return (
+        f"🖼 Photo {best['width']}x{best['height']}\nCaption: {caption}\nSaved: {path}"
+    )
+
+
+async def handle_document(client, msg) -> str:
+    doc = msg["document"]
+    path = await download_file(client, doc["file_id"])
+    return (
+        f"📄 File: {doc.get('file_name')}\n"
+        f"Type: {doc.get('mime_type')}\n"
+        f"Size: {doc.get('file_size')} bytes\n"
+        f"Saved: {path}"
+    )
+
+
+async def handle_voice(client, msg) -> str:
+    voice = msg["voice"]
+    path = await download_file(client, voice["file_id"])  # .oga (OGG/Opus)
+    return f"🎤 Voice note, {voice['duration']}s\nSaved: {path}"
+
+
+async def handle_video(client, msg) -> str:
+    print(f"[INFO] Handling video message: {msg}")
+    video = msg["video"]
+    path = await download_file(client, video["file_id"])  # .mp4
+
+    return (
+        f"🎬 Video {video['width']}x{video['height']}, "
+        f"{video['duration']}s, {video.get('file_size')} bytes \nSaved: {path}"
+    )
+
+
+async def handle_audio(client, msg) -> str:
+    audio = msg["audio"]
+    path = await download_file(client, audio["file_id"])  # .mp3, .m4a, etc.
+    return (
+        f"🎵 Audio: {audio.get('title')} by {audio.get('performer')}\n"
+        f"Duration: {audio['duration']}s \nSaved: {path}"
+    )
+
+
+async def handle_location(client, msg) -> str:
+    loc = msg["location"]
+    return f"📍 Location: lat {loc['latitude']}, lon {loc['longitude']}"
+
+
+async def handle_contact(client, msg) -> str:
+    c = msg["contact"]
+    return f"👤 Contact: {c['first_name']}, phone {c['phone_number']}"
+
+
+async def handle_sticker(client, msg) -> str:
+    s = msg["sticker"]
+    return f"😀 Sticker emoji: {s.get('emoji')}, set: {s.get('set_name')}"
+
+
+async def handle_poll(client, msg) -> str:
+    p = msg["poll"]
+    options = [o["text"] for o in p["options"]]
+    return f"📊 Poll: {p['question']}\nOptions: {options}"
+
+
+async def handle_dice(client, msg) -> str:
+    d = msg["dice"]
+    return f"🎲 Dice {d['emoji']} rolled: {d['value']}"
+
+
+HANDLERS = [
+    ("text", handle_text),
+    ("photo", handle_photo),
+    ("document", handle_document),
+    ("voice", handle_voice),
+    ("audio", handle_audio),
+    ("video", handle_video),
+    ("location", handle_location),
+    ("contact", handle_contact),
+    ("sticker", handle_sticker),
+    ("poll", handle_poll),
+    ("dice", handle_dice),
+]
+
+
+
+================================================
+FILE: src/features/chat/graph/edges.py
+================================================
+# app/features/chat/graph/edges.py
+from src.features.chat.graph.state import ChatAgentState
+
+
+def route_by_intent(state: ChatAgentState) -> str:
+    """Conditional edge router function."""
+    intent = state.user_intent
+
+    if intent == "support":
+        return "generate_response"
+    return "generate_response"  # Route to specific node names based on logic
+
+
+
+================================================
+FILE: src/features/chat/graph/llms.py
+================================================
+from langchain_groq import ChatGroq
+
+# impor settings from core.config
+from src.core.config import get_settings
+
+settings = get_settings()
+
+
+groq = ChatGroq(
+    model="qwen/qwen3.8-27b",
+    api_key=settings.GROQ_API_KEY,
+    temperature=0.7,
+    max_tokens=500,
+)
+
+
+
+================================================
+FILE: src/features/chat/graph/nodes.py
+================================================
+# src/features/chat/graph/nodes.py
+
+# from .workflow import compiled_graph
+from src.features.chat.graph.state import ChatAgentState
+
+from .llms import groq
+
+
+async def categorize_message(state: ChatAgentState) -> dict:
+    """Node 1: Analyze user message intent."""
+    last_message = str(state.messages[-1].content).lower()
+
+    if "help" in last_message or "support" in last_message:
+        intent = "support"
+    else:
+        intent = "general_chat"
+
+    # Return state update dictionary
+    return {"user_intent": intent}
+
+
+async def generate_response(state: ChatAgentState) -> dict:
+    """Node 2: Produce AI reply."""
+    # intent = str(state.user_intent)
+    # user_text = state.messages[-1].content
+
+    messages = state.messages
+    res = await groq.ainvoke(messages)
+    # print(f"AI response: {res}")
+    # reply = f"[{intent.upper()}] You said: '{user_text}'"
+    return {"messages": res}
+
+
+
+================================================
+FILE: src/features/chat/graph/state.py
+================================================
+# app/features/chat/graph/state.py
+from typing import Annotated
+
+from langchain_core.messages import BaseMessage
+from langgraph.graph.message import add_messages
+from pydantic import BaseModel
+
+
+class ChatAgentState(BaseModel):
+    # 'add_messages' appends new entries to existing message list
+    messages: Annotated[list[BaseMessage], add_messages]
+    chat_id: int
+    user_intent: str | None = "general_chat"
+
+
+
+================================================
+FILE: src/features/chat/graph/workflow.py
+================================================
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langgraph.graph import END, START, StateGraph
+
+from src.features.chat.graph.edges import route_by_intent
+from src.features.chat.graph.nodes import categorize_message, generate_response
+from src.features.chat.graph.state import ChatAgentState
+
+# Holds the compiled graph once the app has started.
+# It stays None until init_graph() is called from the lifespan.
+_compiled_graph = None
+
+
+def build_chat_graph(checkpointer: AsyncSqliteSaver):
+    """Build and compile the graph using an already-open async checkpointer."""
+    builder = StateGraph(ChatAgentState)
+
+    # Nodes
+    builder.add_node("categorize_message", categorize_message)
+    builder.add_node("generate_response", generate_response)
+
+    # Edges
+    builder.add_edge(START, "categorize_message")
+    builder.add_conditional_edges(
+        "categorize_message",
+        route_by_intent,
+        {"generate_response": "generate_response"},
+    )
+    builder.add_edge("generate_response", END)
+
+    # The checkpointer is passed in, not created here
+    return builder.compile(checkpointer=checkpointer)
+
+
+def init_graph(checkpointer: AsyncSqliteSaver) -> None:
+    """Called once at startup to store the compiled graph."""
+    global _compiled_graph
+    _compiled_graph = build_chat_graph(checkpointer)
+
+
+# def get_graph():
+#     """Use this everywhere instead of importing compiled_graph directly."""
+#     if _compiled_graph is None:
+#         raise RuntimeError("Graph not initialized. Is the lifespan running?")
+#     return _compiled_graph
+
+
+import asyncio
+
+import aiosqlite
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+_compiled_graph = None
+_lock = asyncio.Lock()  # prevents two requests from initializing at once
+
+
+async def get_graph():
+    """Creates the graph on first call (inside the running event loop), then reuses it."""
+    global _compiled_graph
+    if _compiled_graph is None:
+        async with _lock:
+            if _compiled_graph is None:  # re-check after acquiring the lock
+                # aiosqlite connection is created here, inside async code
+                conn = await aiosqlite.connect("chat_graph_checkpoint.db")
+                checkpointer = AsyncSqliteSaver(conn)
+                await checkpointer.setup()  # creates tables if missing
+                _compiled_graph = build_chat_graph(checkpointer)
+    return _compiled_graph
+
+
