@@ -8,9 +8,13 @@ from src.core.config import get_settings
 from src.features.chat.graph.state import ChatAgentState
 from src.features.chat.graph.workflow import get_graph
 
+# The new base URL format for WhatsApp
+WHATSAPP_API = f"https://graph.facebook.com/v17.0/{settings.WHATSAPP_PHONE_ID}/messages"
+
 settings = get_settings()
-BOT_TOKEN = settings.BOT_TOKEN
-WEBHOOK_SECRET = settings.WEBHOOK_SECRET
+
+whatsapp_token = settings.WHATSAPP_TOKEN
+whatsapp_phone_id = settings.WHATSAPP_PHONE_ID
 
 # Fail fast with a clear message if the token is missing
 if not BOT_TOKEN:
