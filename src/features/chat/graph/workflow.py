@@ -36,7 +36,7 @@ def build_chat_graph(checkpointer: AsyncSqliteSaver):
     builder.add_edge("chat_tools", "chatagent")
 
     # the checkpointer is what gives each thread_id its own memory
-    return builder.compile(checkpointer=checkpointer , interrupt_before=["chat_tools"])
+    return builder.compile(checkpointer=checkpointer)
 
 
 async def get_graph():
