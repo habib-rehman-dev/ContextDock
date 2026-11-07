@@ -3,11 +3,13 @@ import asyncio
 
 import aiosqlite
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-from langgraph.graph import END, START, StateGraph
+from langgraph.graph import START, StateGraph
+from langgraph.prebuilt import ToolNode, tools_condition
 
 # use the same "src." prefix everywhere so imports are consistent
 from src.features.chat.graph.nodes import chat_node
 from src.features.chat.graph.state import SimpleChatState
+from src.features.chat.graph.tools import tools
 
 # holds the compiled graph after the first call; None until then
 _compiled_graph = None
@@ -21,13 +23,20 @@ def build_chat_graph(checkpointer: AsyncSqliteSaver):
 
     # the one and only node
     builder.add_node("chatagent", chat_node)
+    builder.add_node("chat_tools", ToolNode(tools))
 
     # START -> chatagent -> END
     builder.add_edge(START, "chatagent")
-    builder.add_edge("chatagent", END)
+    
+    builder.add_conditional_edges(
+        "chatagent",
+        tools_condition,
+        {"tools": "chat_tools", "__end__": "__end__"},
+    )
+    builder.add_edge("chat_tools", "chatagent")
 
     # the checkpointer is what gives each thread_id its own memory
-    return builder.compile(checkpointer=checkpointer)
+    return builder.compile(checkpointer=checkpointer , interrupt_before=["chat_tools"])
 
 
 async def get_graph():
