@@ -40,3 +40,7 @@ package = false
 members = [
     "ngrok",
 ]
+
+# pyproject.toml
+[tool.fastapi]
+entrypoint = "src.main:app" 

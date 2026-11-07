@@ -1,14 +1,14 @@
-# from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager
 
-# from dotenv import load_dotenv
-# from fastapi import FastAPI
-# from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from dotenv import load_dotenv
+from fastapi import FastAPI
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 # from src.features.chat.graph.workflow import init_graph
-# from src.features.chat.router import app as chat_router
+from src.features.chat.router import app as chat_router
 
-# # Load variables from .env into the environment
-# load_dotenv()
+# Load variables from .env into the environment
+load_dotenv()
 
 
 # @asynccontextmanager
@@ -23,8 +23,8 @@
 #     # leaving the `async with` closes the DB connection
 
 
-# app = FastAPI(lifespan=lifespan)  # <-- add lifespan here
-# app.include_router(chat_router, tags=["chat"])
+app = FastAPI()  # <-- add lifespan here
+app.include_router(chat_router, tags=["chat"])
 
 
 

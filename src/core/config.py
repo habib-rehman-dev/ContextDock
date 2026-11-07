@@ -10,7 +10,7 @@ class Settings(BaseSettings):
 
     WHATSAPP_TOKEN: str
     WHATSAPP_PHONE_ID: str
-    WEBHOOK_VERIFY_TOKEN: str
+    WHATSAPP_WEBHOOK_SECRET: str
 
     GROQ_API_KEY: SecretStr
 
